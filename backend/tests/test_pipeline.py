@@ -479,6 +479,158 @@ class TestSnapshotChain:
         assert snap_file.exists()
 
 
+class TestReplayRecalcChain:
+    """链路11: 故障重采后时间对齐的重算范围复验与缺测检查"""
+
+    def _seed_rule_and_replay(self, rule_id=301, replay_id=302,
+                              rule_no="ALIGN-RE1", replay_no="RANG-RE1",
+                              point="SENS-RE1", start="2026-09-01T10:10:00",
+                              end="2026-09-01T10:30:00", extra_rule=None):
+        from app.store import store
+        rule = {
+            "id": rule_id, "规则编号": rule_no, "对齐粒度": "5min", "时区基准": "UTC+8",
+            "插值方式": "linear", "容许偏移": "100ms", "对齐条数": "0", "未对齐条数": "0",
+            "规则版本": "v1.1", "status": "已生效", "pending": False, "abnormal": False,
+        }
+        rule.update(extra_rule or {})
+        store.rows("time_align").append(rule)
+        store.rows("range_replay").append({
+            "id": replay_id, "重采编号": replay_no, "测点编号": point,
+            "起始时刻": start, "截止时刻": end,
+            "重采原因": "传感器故障", "覆盖方式": "追加", "重采点数": "0", "重采水位": "0",
+            "status": "重采中", "pending": True, "abnormal": False,
+        })
+
+    def test_fault_replay_recheck_scope(self, setup_data_dir):
+        """申请10:10-10:30：10:25补采接纳、10:35范围外排除、10:15覆盖不足、10:20照旧交接值18复算"""
+        from app.services.time_align import TimeAlignService
+        from app.store import store
+
+        self._seed_rule_and_replay()
+        # 重采产物：确凿的边界观测 10:10 / 10:30
+        (setup_data_dir / "replayed_ranges").mkdir(parents=True, exist_ok=True)
+        with open(setup_data_dir / "replayed_ranges" / "RANG-RE1_replay.jsonl", "w", encoding="utf-8") as f:
+            for rec in [
+                {"replay_id": "RANG-RE1", "point": "SENS-RE1",
+                 "original_timestamp": "2026-09-01T10:10:00", "replay_value": 15},
+                {"replay_id": "RANG-RE1", "point": "SENS-RE1",
+                 "original_timestamp": "2026-09-01T10:30:00", "replay_value": 27},
+            ]:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        svc = TimeAlignService()
+        # 质检员开始复验：10:20 已班次交接，旧交接值 18
+        start = svc.start_recheck(301, 302, handover_grids={
+            "2026-09-01T10:20:00": {"value": 18, "交接号": "SHIFT-1020"}})
+        assert "error" not in start
+        by_label = {g["label"]: g for g in start["grids"]}
+        assert by_label["10:10"]["status"] == "已接纳"   # 边界观测
+        assert by_label["10:15"]["pending"] is True       # 覆盖不足的中间格
+        assert by_label["10:20"]["status"] == "已确认"
+        assert by_label["10:30"]["status"] == "已接纳"   # 边界观测
+
+        # 提交前：10:25 补采值 22 获准用于尚未交接的五分钟格；10:35 值 30 在申请之外
+        late = svc.accept_late_records(301, 302, [
+            {"timestamp": "2026-09-01T10:25:00", "point": "SENS-RE1", "value": 22},
+            {"timestamp": "2026-09-01T10:35:00", "point": "SENS-RE1", "value": 30},
+        ])
+        assert late["accepted_now"] == 1
+        assert late["excluded_now"] == 1
+        excluded = late["excluded"][0]
+        assert excluded["value"] == 30 and "范围外" in excluded["reason"]
+
+        # 提交复验：已接纳时格与重采申请关联
+        submit = svc.submit_recheck(301, 302)
+        assert set(submit["linked_grids"]) == {"10:10", "10:25", "10:30"}
+        assert submit["accepted_points"] == 3  # 范围外的 10:35 不作为本次补测
+        recalc = {r["label"]: r for r in submit["recalculated"]}
+        assert recalc["10:20"]["value"] == 18
+        replay = store.find("range_replay", 302)
+        assert replay["重采点数"] == "3"
+        assert "10:25" in replay["关联时格"]
+        rule = store.find("time_align", 301)
+        assert rule["未对齐条数"] == "1"
+        link_file = setup_data_dir / "aligned" / "ALIGN-RE1_replay_link.jsonl"
+        assert link_file.exists()
+        links = [json.loads(line) for line in
+                 link_file.read_text(encoding="utf-8").strip().split("\n")]
+        assert any(l["replay_id"] == "RANG-RE1" and l["grid"].endswith("T10:25:00")
+                   for l in links)
+
+        # 缺测检查：10:25 不再待补、10:15 覆盖不足、10:35 被排除、10:20 用旧交接号复算 18
+        check = svc.missing_check(301, 302)
+        by_label = {g["label"]: g for g in check["grids"]}
+        assert by_label["10:25"]["pending"] is False
+        assert by_label["10:25"]["status"] == "已关联"
+        assert by_label["10:25"]["value"] == 22
+        assert by_label["10:15"]["pending"] is True
+        assert "覆盖不足" in by_label["10:15"]["reason"]
+        assert "10:25" not in check["pending_grids"]
+        assert "10:15" in check["pending_grids"]
+        assert any(e["value"] == 30 and "范围外" in e["reason"] for e in check["excluded"])
+        recalc = {r["label"]: r for r in check["recalculated"]}
+        assert recalc["10:20"]["value"] == 18
+        assert recalc["10:20"]["handover_ref"] == "SHIFT-1020"
+        # 下一段缺测检查：10:30 之后的等长时段全部缺测
+        nxt = check["next_segment"]
+        assert nxt["grids"][0]["label"] == "10:35"
+        assert all(g["status"] == "缺测" for g in nxt["grids"])
+        report_file = setup_data_dir / "aligned" / "ALIGN-RE1_missing_check.jsonl"
+        assert report_file.exists()
+
+    def test_granularity_effective_at_sampling_time(self, setup_data_dir):
+        """粒度沿革：同一批重采记录按采样当时有效的粒度归入不同时间格"""
+        from app.services.time_align import TimeAlignService
+
+        self._seed_rule_and_replay(
+            rule_id=303, replay_id=304, rule_no="ALIGN-RE2", replay_no="RANG-RE2",
+            point="SENS-RE2", start="2026-09-01T09:58:00", end="2026-09-01T10:06:00",
+            extra_rule={"对齐粒度": "1min",
+                        "粒度沿革": [{"生效起点": "2026-09-01T10:00:00", "对齐粒度": "5min"}]})
+        svc = TimeAlignService()
+        svc.start_recheck(303, 304)
+        late = svc.accept_late_records(303, 304, [
+            {"timestamp": "2026-09-01T09:58:30", "point": "SENS-RE2", "value": 11},  # 1min 格 09:58
+            {"timestamp": "2026-09-01T10:02:00", "point": "SENS-RE2", "value": 12},  # 5min 格 10:00
+            {"timestamp": "2026-09-01T10:04:59", "point": "SENS-RE2", "value": 13},  # 5min 格 10:00
+            {"timestamp": "2026-09-01T10:06:00", "point": "SENS-RE2", "value": 14},  # 5min 格 10:05
+        ])
+        assert late["accepted_now"] == 4
+        by_label = {g["label"]: g for g in late["grids"]}
+        assert by_label["09:58"]["status"] == "已接纳"
+        assert by_label["10:00"]["observations"] == 2  # 10:02 与 10:04:59 同格
+        assert by_label["10:05"]["status"] == "已接纳"
+        submit = svc.submit_recheck(303, 304)
+        assert submit["accepted_points"] == 4
+        check = svc.missing_check(303, 304)
+        by_label = {g["label"]: g for g in check["grids"]}
+        assert by_label["10:00"]["value"] == 12.5  # 格内新观测均值
+
+    def test_confirmed_grid_keeps_old_value_against_late_records(self, setup_data_dir):
+        """已交接时格不纳入迟到补采，照旧交接值复算；提交后不再接纳补采"""
+        from app.services.time_align import TimeAlignService
+
+        self._seed_rule_and_replay(
+            rule_id=305, replay_id=306, rule_no="ALIGN-RE3", replay_no="RANG-RE3",
+            point="SENS-RE3", start="2026-09-01T10:10:00", end="2026-09-01T10:20:00")
+        svc = TimeAlignService()
+        svc.start_recheck(305, 306, handover_grids={
+            "2026-09-01T10:15:00": {"value": 18, "交接号": "SHIFT-1015"}})
+        late = svc.accept_late_records(305, 306, [
+            {"timestamp": "2026-09-01T10:15:00", "point": "SENS-RE3", "value": 99},
+        ])
+        assert late["accepted_now"] == 0
+        assert "已交接确认" in late["excluded"][0]["reason"]
+        submit = svc.submit_recheck(305, 306)
+        assert submit["accepted_points"] == 0
+        recalc = {r["label"]: r for r in submit["recalculated"]}
+        assert recalc["10:15"]["value"] == 18
+        # 提交后迟到补采不再接纳
+        again = svc.accept_late_records(305, 306, [
+            {"timestamp": "2026-09-01T10:12:00", "point": "SENS-RE3", "value": 5}])
+        assert "error" in again
+
+
 class TestErrorHandling:
     """异常场景：脏数据、重复批次、中断恢复"""
 
